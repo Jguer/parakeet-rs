@@ -4,6 +4,12 @@ Streaming ASR transcription (real-time, cache-aware stateful)
 Nemotron (default):
 cargo run --release --example streaming 6_speakers.wav
 
+Nemotron (80ms):
+cargo run --release --example streaming 6_speakers.wav ultra
+
+Nemotron (explicit selector + 160ms):
+cargo run --release --example streaming 6_speakers.wav nemotron very-low
+
 EOU:
 cargo run --release --example streaming 6_speakers.wav eou
 
@@ -12,7 +18,7 @@ cargo run --release --example streaming 6_speakers.wav eou
 Nemotron (600M, 24 layers):
 - Download: https://huggingface.co/altunenes/parakeet-rs/tree/main/nemotron-speech-streaming-en-0.6b
 - Files: encoder.onnx, encoder.onnx.data, decoder_joint.onnx, tokenizer.model
-- 560ms chunks
+- Supported latency modes: normal=1.12s, low=0.56s (default), very-low=0.16s, ultra=0.08s
 
 EOU (120M, 17 layers):
 - Download: https://huggingface.co/altunenes/parakeet-rs/tree/main/realtime_eou_120m-v1-onnx
@@ -24,7 +30,7 @@ let reset_on_eou: bool = false;
 I must admit that this is not work very well on my real world tests :/
 */
 
-use parakeet_rs::{Nemotron, ParakeetEOU};
+use parakeet_rs::{LatencyMode, Nemotron, ParakeetEOU};
 use std::env;
 use std::io::Write;
 use std::time::Instant;
@@ -39,7 +45,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "6_speakers.wav"
     };
 
-    let use_eou = args.len() > 2 && args[2] == "eou";
+    let second_arg = args.get(2).map(String::as_str);
+    let use_eou = second_arg == Some("eou");
+    let nemotron_latency = if use_eou {
+        None
+    } else if second_arg == Some("nemotron") {
+        args.get(3).map(String::as_str)
+    } else {
+        second_arg
+    };
 
     // Load audio
     let mut reader = hound::WavReader::open(audio_path)?;
@@ -114,7 +128,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Nemotron (default)
     let mut model = Nemotron::from_pretrained("./nemotron", None)?;
-    let chunk_size = 8960; // 560ms
+    if let Some(latency_str) = nemotron_latency {
+        let latency_mode: LatencyMode = latency_str
+            .parse()
+            .map_err(|e| format!("Invalid Nemotron latency '{latency_str}': {e}"))?;
+        model.set_latency_mode(latency_mode);
+    }
+    let chunk_size = model.chunk_audio_samples();
 
     print!("Streaming: ");
 

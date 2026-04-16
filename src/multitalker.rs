@@ -17,6 +17,7 @@ use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_multitalker::{MultitalkerEncoderCache, MultitalkerModel};
 use crate::nemotron::SentencePieceVocab;
 use crate::sortformer::{Sortformer, NUM_SPEAKERS};
+use crate::streaming::LatencyMode;
 use crate::timestamps::{self, TimestampMode};
 use crate::transcriber::Transcriber;
 use ndarray::{s, Array2, Array3};
@@ -96,63 +97,6 @@ pub struct SpeakerTranscript {
     pub speaker_id: usize,
     pub text: String,
     pub words: Vec<WordTimestamp>,
-}
-
-/// Streaming latency mode controlling the encoder chunk size.
-///
-/// The multitalker encoder was trained with multi-latency masking, so it can
-/// operate at different chunk sizes at inference time. Smaller chunks give
-/// lower latency but reduce accuracy because fewer future frames are available
-/// to the attention layers.
-///
-/// Each mode corresponds to an `att_context_size` configuration in the model:
-/// the second value is the number of future encoded frames the first layer
-/// group can attend to.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum LatencyMode {
-    /// `[70, 13]` -- 14 encoded frames, 112 mel frames, 1.12s latency.
-    /// Highest accuracy. This is the default.
-    #[default]
-    Normal,
-    /// `[70, 6]` -- 7 encoded frames, 56 mel frames, 0.56s latency.
-    Low,
-    /// `[70, 1]` -- 2 encoded frames, 16 mel frames, 0.16s latency.
-    VeryLow,
-    /// `[70, 0]` -- 1 encoded frame, 8 mel frames, 0.08s latency.
-    /// Lowest accuracy.
-    Ultra,
-}
-
-impl LatencyMode {
-    /// Number of mel spectrogram frames per encoder chunk.
-    pub const fn chunk_mel_frames(self) -> usize {
-        match self {
-            Self::Normal => 112,  // 14 * 8
-            Self::Low => 56,      //  7 * 8
-            Self::VeryLow => 16,  //  2 * 8
-            Self::Ultra => 8,     //  1 * 8
-        }
-    }
-
-    /// Number of encoded frames per chunk (after 8x subsampling).
-    pub const fn encoded_frames(self) -> usize {
-        match self {
-            Self::Normal => 14,
-            Self::Low => 7,
-            Self::VeryLow => 2,
-            Self::Ultra => 1,
-        }
-    }
-
-    /// Approximate latency in seconds.
-    pub const fn latency_secs(self) -> f32 {
-        match self {
-            Self::Normal => 1.12,
-            Self::Low => 0.56,
-            Self::VeryLow => 0.16,
-            Self::Ultra => 0.08,
-        }
-    }
 }
 
 /// Runtime configuration for the multitalker pipeline.
@@ -375,7 +319,8 @@ impl MultitalkerASR {
         let is_first_chunk = self.chunk_idx == 0;
         let main_start = processed_mel_frames;
 
-        let mel_chunk = self.build_mel_chunk(&full_mel, main_start, is_first_chunk, expected_size)?;
+        let mel_chunk =
+            self.build_mel_chunk(&full_mel, main_start, is_first_chunk, expected_size)?;
         let chunk_length = expected_size;
 
         let chunk_frame_offset = self.chunk_idx * self.config.latency_mode.encoded_frames();
@@ -744,8 +689,7 @@ impl Transcriber for MultitalkerASR {
             )?;
             self.speakers[0].encoder_cache = new_cache;
 
-            let chunk_frame_offset =
-                chunk_idx * self.config.latency_mode.encoded_frames();
+            let chunk_frame_offset = chunk_idx * self.config.latency_mode.encoded_frames();
             let tokens =
                 self.decode_chunk_for_speaker(0, &encoded, enc_len as usize, chunk_frame_offset)?;
             self.speakers[0].accumulated_tokens.extend(tokens);

@@ -57,17 +57,20 @@ for chunk in audio.chunks(CHUNK_SIZE) {
 
 **Nemotron (Streaming)**: Cache-aware streaming ASR with punctuation
 ```rust
-use parakeet_rs::Nemotron;
+use parakeet_rs::{LatencyMode, Nemotron};
 
 let mut model = Nemotron::from_pretrained("./nemotron", None)?;
+model.set_latency_mode(LatencyMode::VeryLow); // 160ms latency
+let chunk_size = model.chunk_audio_samples();
 
-// Process in 560ms chunks for streaming
-const CHUNK_SIZE: usize = 8960; // 560ms at 16kHz
-for chunk in audio.chunks(CHUNK_SIZE) {
+for chunk in audio.chunks(chunk_size) {
     let text = model.transcribe_chunk(chunk)?;
     print!("{}", text);
 }
 ```
+
+Supported Nemotron latency presets: `LatencyMode::Normal` (1.12s), `LatencyMode::Low`
+(0.56s, default), `LatencyMode::VeryLow` (0.16s), and `LatencyMode::Ultra` (0.08s).
 
 **Multitalker (Streaming Multi-Speaker ASR)**: Speaker-attributed transcription
 ```toml

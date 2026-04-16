@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
 use crate::execution::ModelConfig as ExecutionConfig;
 use crate::model_nemotron::{NemotronEncoderCache, NemotronModel, NemotronModelConfig};
+use crate::streaming::LatencyMode;
 use ndarray::{s, Array2, Array3};
 use realfft::RealFftPlanner;
 use std::f32::consts::PI;
@@ -32,8 +33,6 @@ const VOCAB_SIZE: usize = 1024;
 const BLANK_ID: usize = 1024;
 const DECODER_LSTM_DIM: usize = 640;
 
-// Streaming chunk config
-const CHUNK_SIZE: usize = 56;
 const PRE_ENCODE_CACHE: usize = 9;
 
 /// Minimal SentencePiece vocabulary loader.
@@ -187,9 +186,29 @@ impl SentencePieceVocab {
 
 /// Nemotron streaming ASR model (0.6B parameters).
 /// We dont apply mel normalization unlike others...
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NemotronConfig {
+    pub latency_mode: LatencyMode,
+}
+
+impl Default for NemotronConfig {
+    fn default() -> Self {
+        Self {
+            latency_mode: LatencyMode::Low,
+        }
+    }
+}
+
+impl NemotronConfig {
+    pub fn chunk_size(&self) -> usize {
+        self.latency_mode.chunk_mel_frames()
+    }
+}
+
 pub struct Nemotron {
     model: NemotronModel,
     vocab: SentencePieceVocab,
+    config: NemotronConfig,
     encoder_cache: NemotronEncoderCache,
     state_1: Array3<f32>,
     state_2: Array3<f32>,
@@ -214,6 +233,15 @@ impl Nemotron {
     pub fn from_pretrained<P: AsRef<Path>>(
         path: P,
         exec_config: Option<ExecutionConfig>,
+    ) -> Result<Self> {
+        Self::with_config(path, exec_config, NemotronConfig::default())
+    }
+
+    /// Load Nemotron model from directory with an explicit runtime configuration.
+    pub fn with_config<P: AsRef<Path>>(
+        path: P,
+        exec_config: Option<ExecutionConfig>,
+        config: NemotronConfig,
     ) -> Result<Self> {
         let path = path.as_ref();
 
@@ -243,6 +271,7 @@ impl Nemotron {
         Ok(Self {
             model,
             vocab,
+            config,
             encoder_cache,
             state_1: Array3::zeros((2, 1, DECODER_LSTM_DIM)),
             state_2: Array3::zeros((2, 1, DECODER_LSTM_DIM)),
@@ -284,6 +313,28 @@ impl Nemotron {
         self.vocab.decode(&valid)
     }
 
+    /// Returns the current Nemotron runtime configuration.
+    pub fn nemotron_config(&self) -> &NemotronConfig {
+        &self.config
+    }
+
+    /// Set the streaming latency mode.
+    ///
+    /// Because encoder caches and chunk boundaries depend on the chunk size,
+    /// changing the latency mode resets the current streaming state.
+    pub fn set_latency_mode(&mut self, mode: LatencyMode) {
+        if self.config.latency_mode != mode {
+            self.config.latency_mode = mode;
+            self.reset();
+        }
+    }
+
+    /// Returns the recommended number of audio samples to provide per chunk
+    /// for the current latency mode.
+    pub fn chunk_audio_samples(&self) -> usize {
+        self.config.chunk_size() * HOP_LENGTH
+    }
+
     /// note that, offline transcription for testing/debugging and for some curious ppl :-). with following function too (transcribe_audio)
     pub fn transcribe_file<P: AsRef<Path>>(&mut self, audio_path: P) -> Result<String> {
         let (audio, spec) = crate::audio::load_audio(audio_path)?;
@@ -314,12 +365,13 @@ impl Nemotron {
         let mut all_tokens: Vec<usize> = Vec::new();
         let mut buffer_idx = 0;
         let mut chunk_idx = 0;
+        let chunk_size = self.config.chunk_size();
 
         while buffer_idx < total_frames {
-            let chunk_end = (buffer_idx + CHUNK_SIZE).min(total_frames);
+            let chunk_end = (buffer_idx + chunk_size).min(total_frames);
             let main_len = chunk_end - buffer_idx;
 
-            let expected_size = PRE_ENCODE_CACHE + CHUNK_SIZE;
+            let expected_size = PRE_ENCODE_CACHE + chunk_size;
             let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
 
             // Fill pre-encode cache from previous frames
@@ -352,7 +404,7 @@ impl Nemotron {
             let new_tokens = self.decode_chunk(&encoded, enc_len as usize)?;
             all_tokens.extend(new_tokens);
 
-            buffer_idx += CHUNK_SIZE;
+            buffer_idx += chunk_size;
             chunk_idx += 1;
         }
 
@@ -382,27 +434,28 @@ impl Nemotron {
         let total_mel_frames = full_mel.shape()[1];
 
         // Calculate how many mel frames correspond to processed audio
-        // Each CHUNK_SIZE mel frames = CHUNK_SIZE * HOP_LENGTH audio samples
+        // Each chunk_size mel frames = chunk_size * HOP_LENGTH audio samples
         let processed_mel_frames = self.audio_processed / HOP_LENGTH;
+        let chunk_size = self.config.chunk_size();
 
         // Check if we have enough NEW frames to process a chunk
         let available_new_frames = total_mel_frames.saturating_sub(processed_mel_frames);
-        if available_new_frames < CHUNK_SIZE {
+        if available_new_frames < chunk_size {
             return Ok(String::new());
         }
 
         // Build encoder input chunk
-        let expected_size = PRE_ENCODE_CACHE + CHUNK_SIZE;
+        let expected_size = PRE_ENCODE_CACHE + chunk_size;
         let mut chunk_data = vec![0.0f32; N_MELS * expected_size];
 
         // Determine the mel frame range for this chunk
         let is_first_chunk = self.chunk_idx == 0;
         let main_start = processed_mel_frames;
-        let _main_end = main_start + CHUNK_SIZE;
+        let _main_end = main_start + chunk_size;
 
         if is_first_chunk {
             // First chunk: zero-pad for pre-encode cache
-            for f in 0..CHUNK_SIZE.min(total_mel_frames) {
+            for f in 0..chunk_size.min(total_mel_frames) {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] = full_mel[[m, f]];
                 }
@@ -422,7 +475,7 @@ impl Nemotron {
             }
 
             // Fill main chunk
-            for f in 0..CHUNK_SIZE.min(total_mel_frames - main_start) {
+            for f in 0..chunk_size.min(total_mel_frames - main_start) {
                 for m in 0..N_MELS {
                     chunk_data[m * expected_size + PRE_ENCODE_CACHE + f] =
                         full_mel[[m, main_start + f]];
@@ -442,12 +495,12 @@ impl Nemotron {
         self.accumulated_tokens.extend(&tokens);
 
         // Advance processed position
-        self.audio_processed += CHUNK_SIZE * HOP_LENGTH;
+        self.audio_processed += chunk_size * HOP_LENGTH;
         self.chunk_idx += 1;
 
         // Trim audio buffer to keep memory bounded
         // Keep enough for pre-encode cache context
-        let keep_samples = (PRE_ENCODE_CACHE + CHUNK_SIZE) * HOP_LENGTH + WIN_LENGTH;
+        let keep_samples = (PRE_ENCODE_CACHE + chunk_size) * HOP_LENGTH + WIN_LENGTH;
         if self.audio_buffer.len() > keep_samples * 2 {
             let remove = self.audio_buffer.len() - keep_samples;
             // Adjust processed counter since we're removing from the start
@@ -588,5 +641,26 @@ impl Nemotron {
         (0..WIN_LENGTH)
             .map(|i| 0.5 - 0.5 * ((2.0 * PI * i as f32) / ((WIN_LENGTH - 1) as f32)).cos())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NemotronConfig;
+    use crate::LatencyMode;
+
+    #[test]
+    fn nemotron_config_defaults_to_current_chunk_size() {
+        let config = NemotronConfig::default();
+        assert_eq!(config.chunk_size(), 56);
+        assert_eq!(config.latency_mode, LatencyMode::Low);
+    }
+
+    #[test]
+    fn nemotron_config_tracks_selected_latency_mode() {
+        let config = NemotronConfig {
+            latency_mode: LatencyMode::Ultra,
+        };
+        assert_eq!(config.chunk_size(), 8);
     }
 }
